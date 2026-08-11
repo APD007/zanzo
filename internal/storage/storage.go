@@ -101,9 +101,9 @@ type Memory struct {
 }
 
 type row struct {
-	tuple      Tuple
-	created    Revision
-	deleted    Revision // 0 means live
+	tuple   Tuple
+	created Revision
+	deleted Revision // 0 means live
 }
 
 func NewMemory() *Memory {

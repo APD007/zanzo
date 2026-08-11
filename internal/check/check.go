@@ -33,7 +33,32 @@ type Engine struct {
 	Schema   *schema.Schema
 	Store    storage.Store
 	MaxDepth int
+	// Cache is optional and shared across requests. Safe only because every
+	// key carries the revision it was computed at; see cache.go.
+	Cache Cache
 }
+
+// Consistency selects the snapshot a check runs against. The trade is latency
+// against staleness, and only the caller knows which one they need: a UI
+// listing tolerates a stale read, the request right after a revocation does not.
+type Consistency int
+
+const (
+	// MinimizeLatency reads at whatever revision is already current. Cheapest,
+	// and may serve a cached answer from a slightly older snapshot.
+	MinimizeLatency Consistency = iota
+	// AtLeastAsFresh pins the check to at least the revision carried by the
+	// caller's token. This is what closes the new-enemy hole: a client that
+	// has just revoked access presents the token from that write, and the
+	// engine may not answer from anything older.
+	AtLeastAsFresh
+	// FullConsistency always reads at head. Correct, and the most expensive.
+	FullConsistency
+)
+
+// Token is an opaque consistency token -- Zanzibar calls it a zookie. Clients
+// treat it as a blob; it is handed out by writes and handed back on reads.
+type Token struct{ Revision storage.Revision }
 
 func New(s *schema.Schema, st storage.Store) *Engine {
 	return &Engine{Schema: s, Store: st, MaxDepth: DefaultMaxDepth}
@@ -47,6 +72,10 @@ type Request struct {
 	// uses it, so a check cannot observe a write that lands mid-evaluation and
 	// return an answer that was never true at any single point in time.
 	Revision storage.Revision
+
+	Consistency Consistency
+	// Token is the caller's zookie, honoured when Consistency is AtLeastAsFresh.
+	Token Token
 }
 
 // Result carries the decision plus enough detail to explain and profile it.
@@ -55,7 +84,11 @@ type Result struct {
 	// Expansions counts subproblems actually evaluated (memo hits excluded).
 	Expansions int
 	MemoHits   int
+	CacheHits  int
 	MaxDepth   int
+	// Revision is the snapshot the answer was computed at. Callers echo it
+	// back as a token on the next request that must not regress.
+	Revision storage.Revision
 }
 
 type memoKey struct {
@@ -80,7 +113,19 @@ func (e *Engine) Check(ctx context.Context, req Request) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		req.Revision = head
+		switch req.Consistency {
+		case AtLeastAsFresh:
+			// Never answer from a snapshot older than what the caller has
+			// already observed. head is normally ahead of the token; if a
+			// replica lagged behind it, reading at the token is what keeps a
+			// just-revoked grant from reappearing.
+			req.Revision = head
+			if req.Token.Revision > head {
+				req.Revision = req.Token.Revision
+			}
+		default:
+			req.Revision = head
+		}
 	}
 	ev := &evaluation{
 		engine:   e,
@@ -93,6 +138,7 @@ func (e *Engine) Check(ctx context.Context, req Request) (Result, error) {
 		return Result{}, err
 	}
 	ev.result.Allowed = allowed
+	ev.result.Revision = req.Revision
 	return ev.result, nil
 }
 
@@ -115,6 +161,19 @@ func (ev *evaluation) check(ctx context.Context, object storage.Object, relation
 	if got, ok := ev.memo[k]; ok {
 		ev.result.MemoHits++
 		return got, nil
+	}
+	ck := Key{
+		Object:   object,
+		Relation: relation,
+		Subject:  ev.req.Subject.String(),
+		Revision: ev.req.Revision,
+	}
+	if ev.engine.Cache != nil {
+		if got, ok := ev.engine.Cache.Get(ck); ok {
+			ev.result.CacheHits++
+			ev.memo[k] = got
+			return got, nil
+		}
 	}
 	if ev.visiting[k] {
 		// Already being computed further up the stack. Returning false is
@@ -139,6 +198,9 @@ func (ev *evaluation) check(ctx context.Context, object storage.Object, relation
 		return false, err
 	}
 	ev.memo[k] = allowed
+	if ev.engine.Cache != nil {
+		ev.engine.Cache.Set(ck, allowed)
+	}
 	return allowed, nil
 }
 
