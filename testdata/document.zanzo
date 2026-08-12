@@ -1,0 +1,19 @@
+definition user {}
+
+definition group {
+  relation member: user | group#member
+}
+
+definition folder {
+  relation viewer: user | group#member
+}
+
+definition document {
+  relation parent: folder
+  relation owner: user
+  relation editor: user | group#member
+  relation banned: user
+
+  permission edit = editor + owner
+  permission view = (edit + parent->viewer) - banned
+}
