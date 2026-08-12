@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 )
 
@@ -169,18 +168,15 @@ func (p *Postgres) Read(ctx context.Context, rev Revision, object Object, relati
 	return out, rows.Err()
 }
 
-// ErrNotImplemented marks the reverse-index query that ListObjects will need.
-var ErrNotImplemented = errors.New("storage: not implemented")
-
 // ReadBySubject walks the reverse index: every object to which this subject is
 // related. It is the primitive ListObjects is built from, and the reason
-// idx_tuple_reverse exists.
+// idx_tuple_reverse exists. A relation of "" matches any relation.
 func (p *Postgres) ReadBySubject(ctx context.Context, rev Revision, subject Subject, relation string) ([]Tuple, error) {
 	rows, err := p.db.QueryContext(ctx, `
         SELECT object_type, object_id, relation
           FROM tuples
          WHERE subject_type = $1 AND subject_id = $2 AND subject_relation = $3
-           AND relation = $4
+           AND ($4 = '' OR relation = $4)
            AND created_rev <= $5
            AND (deleted_rev = 0 OR deleted_rev > $5)`,
 		subject.Object.Type, subject.Object.ID, subject.Relation, relation, rev)

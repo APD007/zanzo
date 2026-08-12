@@ -48,6 +48,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/check", s.instrument("/v1/check", s.handleCheck))
 	mux.HandleFunc("POST /v1/write", s.instrument("/v1/write", s.handleWrite))
+	mux.HandleFunc("POST /v1/list-objects", s.instrument("/v1/list-objects", s.handleListObjects))
+	mux.HandleFunc("POST /v1/expand", s.instrument("/v1/expand", s.handleExpand))
 	mux.HandleFunc("GET /healthz", s.instrument("/healthz", s.handleHealth))
 	return mux
 }
@@ -268,4 +270,109 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+type listRequest struct {
+	Subject    string `json:"subject"`
+	Permission string `json:"permission"`
+	ObjectType string `json:"object_type"`
+	Limit      int    `json:"limit,omitempty"`
+}
+
+type listResponse struct {
+	Objects []string `json:"objects"`
+	Token   string   `json:"token"`
+	// Candidates exposes how many objects the reverse walk proposed before
+	// verification. A caller does not need it; an operator watching the
+	// reverse index earn or fail to earn its write cost does.
+	Candidates int `json:"candidates"`
+}
+
+func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request) {
+	var req listRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "request body is not valid JSON")
+		return
+	}
+	subject, err := storage.ParseSubject(req.Subject)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Permission == "" || req.ObjectType == "" {
+		writeError(w, http.StatusBadRequest, "permission and object_type are required")
+		return
+	}
+	// An unbounded list is a denial-of-service against ourselves, so the API
+	// caps what the library leaves open.
+	if req.Limit <= 0 || req.Limit > 1000 {
+		req.Limit = 1000
+	}
+
+	res, err := s.Engine.ListObjects(r.Context(), check.ListRequest{
+		Subject:    subject,
+		Permission: req.Permission,
+		ObjectType: req.ObjectType,
+		Limit:      req.Limit,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			writeError(w, StatusClientClosed, "client closed request")
+		default:
+			s.logf("list-objects %s %s/%s: %v", req.Subject, req.ObjectType, req.Permission, err)
+			writeError(w, http.StatusInternalServerError, "list failed")
+		}
+		return
+	}
+	objects := make([]string, 0, len(res.Objects))
+	for _, o := range res.Objects {
+		objects = append(objects, o.String())
+	}
+	writeJSON(w, http.StatusOK, listResponse{
+		Objects:    objects,
+		Token:      formatToken(res.Revision),
+		Candidates: res.Candidates,
+	})
+}
+
+type expandRequest struct {
+	Object   string `json:"object"`
+	Relation string `json:"relation"`
+}
+
+type expandResponse struct {
+	Tree  *check.TreeNode `json:"tree"`
+	Token string          `json:"token"`
+}
+
+func (s *Server) handleExpand(w http.ResponseWriter, r *http.Request) {
+	var req expandRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "request body is not valid JSON")
+		return
+	}
+	object, err := storage.ParseObject(req.Object)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Relation == "" {
+		writeError(w, http.StatusBadRequest, "relation is required")
+		return
+	}
+	res, err := s.Engine.Expand(r.Context(), check.ExpandRequest{Object: object, Relation: req.Relation})
+	if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			writeError(w, StatusClientClosed, "client closed request")
+		case errors.Is(err, check.ErrDepthExceeded):
+			writeError(w, http.StatusUnprocessableEntity, "expand exceeded maximum depth")
+		default:
+			s.logf("expand %s#%s: %v", req.Object, req.Relation, err)
+			writeError(w, http.StatusInternalServerError, "expand failed")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, expandResponse{Tree: res.Tree, Token: formatToken(res.Revision)})
 }

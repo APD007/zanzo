@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 
 	_ "github.com/lib/pq"
@@ -30,17 +31,41 @@ func stores(t *testing.T) []storeFactory {
 		return out
 	}
 	out = append(out, storeFactory{"postgres", func(t *testing.T) Store {
-		db, err := sql.Open("postgres", dsn)
+		ctx := context.Background()
+
+		// The suite truncates between cases, so it must never run against
+		// whatever tables the DSN happens to point at. An earlier version did,
+		// and quietly wiped a 45,300-tuple benchmark dataset in the middle of
+		// a run -- the tests passed, and the data was gone.
+		//
+		// Everything here lives in a dedicated Postgres schema instead. The
+		// application's DDL is unqualified, so search_path is enough to
+		// redirect it without the store knowing.
+		admin, err := sql.Open("postgres", dsn)
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
+		if _, err := admin.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS zanzo_test`); err != nil {
+			admin.Close()
+			t.Fatalf("create test schema: %v", err)
+		}
+		admin.Close()
+
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		db, err := sql.Open("postgres", dsn+sep+"search_path=zanzo_test")
+		if err != nil {
+			t.Fatalf("open test schema: %v", err)
+		}
 		p := NewPostgres(db)
-		ctx := context.Background()
 		if err := p.Migrate(ctx); err != nil {
 			t.Fatalf("migrate: %v", err)
 		}
-		// Each run starts from empty so revision numbers are predictable.
-		if _, err := db.ExecContext(ctx, `TRUNCATE tuples, revisions RESTART IDENTITY`); err != nil {
+		// Each case starts from empty so revision numbers are predictable.
+		if _, err := db.ExecContext(ctx,
+			`TRUNCATE zanzo_test.tuples, zanzo_test.revisions RESTART IDENTITY`); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
 		t.Cleanup(func() { db.Close() })

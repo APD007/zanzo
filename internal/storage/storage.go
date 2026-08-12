@@ -58,6 +58,13 @@ type Store interface {
 	// Read returns tuples matching object+relation at the given revision.
 	Read(ctx context.Context, rev Revision, object Object, relation string) ([]Tuple, error)
 	Head(ctx context.Context) (Revision, error)
+	// ReadBySubject walks the index in the other direction: every tuple whose
+	// subject is the given one. Pass relation "" to match any relation.
+	//
+	// Check never needs this. ListObjects cannot be answered without it, and
+	// the cost of maintaining a second index is exactly why Zanzibar treats
+	// the reverse direction as a separate system rather than a free extra.
+	ReadBySubject(ctx context.Context, rev Revision, subject Subject, relation string) ([]Tuple, error)
 }
 
 // ParseSubject accepts "user:ayush" or "group:eng#member".
@@ -98,6 +105,9 @@ type Memory struct {
 	rows []row
 	// index maps object+relation to row offsets so a read does not scan.
 	index map[string][]int
+	// reverse maps subject to row offsets, mirroring idx_tuple_reverse in the
+	// Postgres store so both implementations pay the same write cost.
+	reverse map[string][]int
 }
 
 type row struct {
@@ -107,7 +117,7 @@ type row struct {
 }
 
 func NewMemory() *Memory {
-	return &Memory{index: map[string][]int{}}
+	return &Memory{index: map[string][]int{}, reverse: map[string][]int{}}
 }
 
 func key(o Object, relation string) string { return o.String() + "#" + relation }
@@ -143,6 +153,8 @@ func (m *Memory) Write(ctx context.Context, add []Tuple, remove []Tuple) (Revisi
 		m.rows = append(m.rows, row{tuple: t, created: rev})
 		k := key(t.Object, t.Relation)
 		m.index[k] = append(m.index[k], len(m.rows)-1)
+		sk := t.Subject.String()
+		m.reverse[sk] = append(m.reverse[sk], len(m.rows)-1)
 	}
 	return rev, nil
 }
@@ -165,4 +177,20 @@ func (m *Memory) Head(ctx context.Context) (Revision, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.head, nil
+}
+
+func (m *Memory) ReadBySubject(ctx context.Context, rev Revision, subject Subject, relation string) ([]Tuple, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []Tuple
+	for _, i := range m.reverse[subject.String()] {
+		r := m.rows[i]
+		if relation != "" && r.tuple.Relation != relation {
+			continue
+		}
+		if r.created <= rev && (r.deleted == 0 || r.deleted > rev) {
+			out = append(out, r.tuple)
+		}
+	}
+	return out, nil
 }
